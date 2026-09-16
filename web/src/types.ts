@@ -99,6 +99,38 @@ export interface Trace {
 }
 
 /* ------------------------------------------------------------------ */
+/* Report Card (guardrail eval suite)                                  */
+/* ------------------------------------------------------------------ */
+export type EvalStatus = 'held' | 'slipped' | 'grounded' | 'info' | 'failed';
+
+export interface EvalCaseResult {
+  id: string;
+  title: string;
+  guardrail: string;
+  status: EvalStatus;
+  outcome: string;
+  detail?: string;
+}
+
+export interface EvalSummary {
+  holding: number;
+  total: number;
+  disabled: number;
+  failed: number;
+}
+
+export interface EvalReport {
+  settings: {
+    guardrails: boolean;
+    on_task: boolean;
+    cached_mode: boolean;
+    model: string;
+  };
+  cases: EvalCaseResult[];
+  summary: EvalSummary;
+}
+
+/* ------------------------------------------------------------------ */
 /* Operator / SSE events                                               */
 /* ------------------------------------------------------------------ */
 export interface OrderItem {

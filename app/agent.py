@@ -38,6 +38,13 @@ SYSTEM_PROMPT = (
     "As soon as they confirm (e.g. 'yes'), IMMEDIATELY call place_order for that reservation and "
     "give them the order reference. Do not ask them to confirm twice. "
     "A customer name is OPTIONAL — never ask for it; if they did not give one, place the order without it. "
+    "For any question about an existing order (its status or what is in it), use lookup_order with the "
+    "reference like ABEG-7F3K9Q; it only reads and never changes anything. Suggest popular in-stock items "
+    "with recommend_items when the customer asks what to get. "
+    "Cancelling is different: only cancel an order when the customer EXPLICITLY asks to cancel it, never on a "
+    "status question. Before cancelling, show them the order with lookup_order and ask them to confirm, then "
+    "call cancel_order with confirm set to true. Never set confirm true unless the customer has clearly said "
+    "yes to cancelling. "
     "Work quietly: do NOT announce that you are about to look something up, and do NOT narrate or name "
     "the tools you use (no 'let me check…'). Just use the tools you need, then reply ONCE with a short, "
     "friendly final answer. "
@@ -97,6 +104,66 @@ _UNGROUNDED_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Some providers emulate tool-calling by prompting, and a few models echo that
+# scaffolding instruction into their reply. We drop it so it never reaches the UI.
+_LEAKED_PREAMBLES = (
+    "Use the results below to formulate an answer to the user question unless additional information is needed.",
+    "Use the results below to formulate an answer to the user question unless additional information is needed",
+)
+
+
+class _PreambleStripper:
+    """Removes a leaked tool-scaffolding preamble from the start of a reply.
+
+    Fed the streamed text of one reply segment, it holds back the leading bytes
+    only while they still look like the start of a known preamble, then releases
+    the rest untouched. A normal reply diverges on the first token and streams
+    with no delay; a leaked preamble is dropped without waiting for the whole
+    reply. Anything held that turns out not to be a preamble is released on flush.
+    """
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._released = False
+        self._lstrip_next = False
+
+    def feed(self, text: str) -> str:
+        if self._released:
+            if self._lstrip_next:
+                text = text.lstrip()
+                if text:
+                    self._lstrip_next = False
+            return text
+        self._buf += text
+        lead = self._buf.lstrip()
+        # Still ambiguous: the text so far is a strict prefix of a preamble.
+        for p in _LEAKED_PREAMBLES:
+            if p.startswith(lead) and lead != p:
+                return ""
+        # Matches a full preamble: drop it, keep only what follows.
+        for p in _LEAKED_PREAMBLES:
+            if lead.startswith(p):
+                self._released = True
+                remainder = lead[len(p):].lstrip()
+                if not remainder:
+                    self._lstrip_next = True
+                return remainder
+        # Not a preamble: release everything buffered, as-is.
+        self._released = True
+        out, self._buf = self._buf, ""
+        return out
+
+    def flush(self) -> str:
+        if self._released:
+            return ""
+        held, self._buf = self._buf, ""
+        self._released = True
+        lead = held.lstrip()
+        for p in _LEAKED_PREAMBLES:
+            if p.startswith(lead):
+                return ""
+        return held
+
 
 def _system_message() -> dict:
     # Workshop lets a learner edit the live prompt; empty => built-in default.
@@ -122,6 +189,14 @@ def _tool_activity_label(name: str, args: dict) -> str:
         return "Placing your order"
     if name == "cancel_reservation":
         return "Cancelling the hold"
+    if name == "lookup_order":
+        ref = args.get("reference") or ""
+        return f"Looking up order {ref}" if ref else "Looking up your order"
+    if name == "recommend_items":
+        return "Picking some suggestions"
+    if name == "cancel_order":
+        ref = args.get("reference") or ""
+        return f"Cancelling order {ref}" if ref else "Cancelling your order"
     return "Working on it"
 
 
@@ -160,6 +235,30 @@ def _tool_step(name: str, args: dict, result: dict, ms: int) -> dict:
     elif name == "cancel_reservation":
         title = "Cancelled the hold"
         outcome = "reservation released"
+    elif name == "lookup_order":
+        if result.get("error"):
+            title = "Looked up an order — not found"
+            outcome = str(result.get("reference") or "no such reference")
+        else:
+            title = "Looked up an order"
+            outcome = f"{result.get('reference')}: {result.get('status')}"
+    elif name == "recommend_items":
+        title = "Suggested some items"
+        recs = result.get("recommendations") or []
+        outcome = ", ".join(r.get("name") or r.get("sku") for r in recs) or "no items in stock"
+    elif name == "cancel_order":
+        if result.get("error"):
+            title = "Tried to cancel an order — not found"
+            outcome = str(result.get("reference") or "no such reference")
+        elif result.get("needs_confirmation"):
+            title = "Asked to confirm before cancelling"
+            outcome = "waiting for the customer to confirm"
+        elif result.get("already_cancelled"):
+            title = "Order was already cancelled"
+            outcome = str(result.get("reference") or "")
+        else:
+            title = "Cancelled the order"
+            outcome = str(result.get("reference") or "order cancelled")
     return {"kind": "tool", "name": name, "title": title, "outcome": outcome, "ms": ms}
 
 
@@ -200,6 +299,14 @@ async def _dispatch_tool(pool: asyncpg.Pool, session_id: str, name: str, argumen
         )
     if name == "cancel_reservation":
         return await func(pool, args.get("reservation_id", ""), session_id=session_id)
+    if name == "lookup_order":
+        return await func(pool, args.get("reference", ""), session_id=session_id)
+    if name == "recommend_items":
+        return await func(pool, args.get("limit", 3), session_id=session_id)
+    if name == "cancel_order":
+        return await func(
+            pool, args.get("reference", ""), bool(args.get("confirm", False)), session_id=session_id
+        )
     return await func(pool, **args)
 
 
@@ -210,6 +317,7 @@ async def run_turn(
     history: list[dict] | None = None,
     api_key: str | None = None,
     image: str | None = None,
+    llm=None,
 ) -> AsyncIterator[dict]:
     # Build/resume history.
     if history is not None:
@@ -236,7 +344,10 @@ async def run_turn(
     else:
         messages.append({"role": "user", "content": user_text})
 
-    llm = get_llm(api_key=api_key)
+    # An explicit llm lets a caller (for example the eval runner) drive a specific
+    # client without global monkeypatching. Otherwise pick the usual one.
+    if llm is None:
+        llm = get_llm(api_key=api_key)
     tool_calls_this_turn = 0
     final_text_parts: list[str] = []
     bounded_hit = False
@@ -255,12 +366,13 @@ async def run_turn(
         assistant_text_parts: list[str] = []
         pending_tool_calls: list[dict] = []
         segment_started = False   # first delta of THIS reply segment?
+        stripper = _PreambleStripper()
 
         async for item in llm.stream(messages, TOOL_SCHEMAS):
             itype = item.get("type")
             if itype == "delta":
-                text = item.get("text", "")
-                if text:
+                cleaned = stripper.feed(item.get("text", ""))
+                if cleaned:
                     if ttft_ms is None:
                         ttft_ms = int((time.perf_counter() - t0) * 1000)
                     # Separate a post-tool-call reply from earlier text with a
@@ -268,8 +380,8 @@ async def run_turn(
                     prefix = "\n\n" if (emitted_any_text and not segment_started) else ""
                     segment_started = True
                     emitted_any_text = True
-                    assistant_text_parts.append(text)
-                    ev = make_event("assistant_delta", {"text": prefix + text}, session_id)
+                    assistant_text_parts.append(cleaned)
+                    ev = make_event("assistant_delta", {"text": prefix + cleaned}, session_id)
                     bus.publish(ev)
                     yield ev
             elif itype == "tool_calls":
@@ -286,6 +398,19 @@ async def run_turn(
                     pass
             elif itype == "done":
                 pass
+
+        # Release anything the stripper held back that was not a leaked preamble.
+        tail = stripper.flush()
+        if tail:
+            if ttft_ms is None:
+                ttft_ms = int((time.perf_counter() - t0) * 1000)
+            prefix = "\n\n" if (emitted_any_text and not segment_started) else ""
+            segment_started = True
+            emitted_any_text = True
+            assistant_text_parts.append(tail)
+            ev = make_event("assistant_delta", {"text": prefix + tail}, session_id)
+            bus.publish(ev)
+            yield ev
 
         if assistant_text_parts:
             final_text_parts.append("".join(assistant_text_parts))

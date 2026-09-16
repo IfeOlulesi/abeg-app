@@ -24,6 +24,8 @@ from app.config import settings
 def _reset_settings() -> None:
     settings.guardrails = True
     settings.cached_mode = False
+    settings.on_task = True
+    settings.system_prompt = ""
     settings.reservation_ttl_seconds = 90
     settings.max_tool_calls = 5
 

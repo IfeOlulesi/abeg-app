@@ -5,9 +5,10 @@ import Chat from './components/Chat';
 import Backstage from './components/Backstage';
 import { useChat } from './hooks/useChat';
 import { useOperatorEvents } from './hooks/useOperatorEvents';
-import { getState, getProducts, post } from './lib/api';
+import { getState, getProducts, post, runEvals } from './lib/api';
 import { naira, firstLine } from './lib/format';
 import type {
+  EvalReport,
   EventData,
   Model,
   OperatorEvent,
@@ -48,6 +49,10 @@ export default function App() {
   const [defaultPrompt, setDefaultPrompt] = useState('');
   const [promptCustomized, setPromptCustomized] = useState(false);
   const [trace, setTrace] = useState<Trace | null>(null);
+  // Report Card (guardrail eval suite).
+  const [report, setReport] = useState<EvalReport | null>(null);
+  const [evalsRunning, setEvalsRunning] = useState(false);
+  const [reportSignal, setReportSignal] = useState(0);
 
   // Refs mirror state for use inside event handlers / keyboard without
   // re-subscribing.
@@ -59,6 +64,8 @@ export default function App() {
   cachedRef.current = cached;
   const onTaskRef = useRef(onTask);
   onTaskRef.current = onTask;
+  const evalsRunningRef = useRef(evalsRunning);
+  evalsRunningRef.current = evalsRunning;
 
   const nameFor = useCallback((sku: string) => {
     const p = productsRef.current.find((x) => x.sku === sku);
@@ -255,6 +262,18 @@ export default function App() {
     const res = await post('/api/control/scripted', { n });
     if (res && res.message) sendChatRef.current(res.message);
   }, []);
+  const onRunEvals = useCallback(async () => {
+    if (evalsRunningRef.current) return;
+    setDrawerOpen(true);
+    setReportSignal((x) => x + 1); // ask the Workshop to show the Report Card tab
+    setEvalsRunning(true);
+    try {
+      const r = await runEvals();
+      if (r) setReport(r);
+    } finally {
+      setEvalsRunning(false);
+    }
+  }, []);
 
   // ---- keyboard shortcuts (ignored while typing in inputs) ----
   useEffect(() => {
@@ -304,13 +323,18 @@ export default function App() {
           e.preventDefault();
           setDrawerOpen((v) => !v);
           break;
+        case 'e':
+        case 'E':
+          e.preventDefault();
+          onRunEvals();
+          break;
         default:
           break;
       }
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [onScript, onRace, onReset, onToggleGuardrails, onToggleCached, onToggleOnTask]);
+  }, [onScript, onRace, onReset, onToggleGuardrails, onToggleCached, onToggleOnTask, onRunEvals]);
 
   const sortedProducts = useMemo(() => products, [products]);
 
@@ -371,6 +395,10 @@ export default function App() {
         products={sortedProducts}
         timeline={timeline}
         trace={trace}
+        report={report}
+        onRunEvals={onRunEvals}
+        evalsRunning={evalsRunning}
+        showReportSignal={reportSignal}
       />
     </>
   );

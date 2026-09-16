@@ -22,6 +22,7 @@ CREATE TABLE orders (
   reference TEXT UNIQUE NOT NULL,
   customer_name TEXT,
   total NUMERIC(10,2) NOT NULL,
+  status TEXT NOT NULL DEFAULT 'placed',  -- placed | cancelled
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE TABLE order_items (

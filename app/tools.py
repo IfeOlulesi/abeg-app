@@ -589,6 +589,237 @@ async def cancel_reservation(pool: asyncpg.Pool, reservation_id: str, session_id
 
 
 # --------------------------------------------------------------------------
+# Tool 6: lookup_order
+# --------------------------------------------------------------------------
+async def lookup_order(pool: asyncpg.Pool, reference: str, session_id: str | None = None) -> dict:
+    """Read-only order status by reference. Never fabricates a status."""
+    call_id = _emit_call("lookup_order", {"reference": reference}, session_id)
+    started = time.perf_counter()
+    ref = (reference or "").strip().upper()
+    async with pool.acquire() as conn:
+        order = await conn.fetchrow(
+            "SELECT id, reference, customer_name, total, status, created_at "
+            "FROM orders WHERE reference = $1",
+            ref,
+        )
+        if order is None:
+            result = {"error": "unknown_order", "reference": reference}
+        else:
+            rows = await conn.fetch(
+                "SELECT oi.sku, p.name, oi.qty, oi.unit_price "
+                "FROM order_items oi JOIN products p ON p.sku = oi.sku "
+                "WHERE oi.order_id = $1 ORDER BY oi.sku",
+                order["id"],
+            )
+            result = {
+                "reference": order["reference"],
+                "status": order["status"],
+                "customer_name": order["customer_name"],
+                "total": float(order["total"]),
+                "created_at": order["created_at"].isoformat(),
+                "items": [
+                    {
+                        "sku": r["sku"],
+                        "name": r["name"],
+                        "qty": int(r["qty"]),
+                        "unit_price": float(r["unit_price"]),
+                    }
+                    for r in rows
+                ],
+            }
+    _emit_result("lookup_order", call_id, result, started, session_id)
+    return result
+
+
+# --------------------------------------------------------------------------
+# Tool 7: recommend_items
+# --------------------------------------------------------------------------
+async def recommend_items(pool: asyncpg.Pool, limit: int = 3, session_id: str | None = None) -> dict:
+    """Suggest popular in-stock items only.
+
+    Popularity is real order history (sum of ordered qty from non-cancelled
+    orders). Anything out of stock is filtered out, so the model can only ever
+    recommend items that actually exist and are available right now.
+    """
+    call_id = _emit_call("recommend_items", {"limit": limit}, session_id)
+    started = time.perf_counter()
+    try:
+        n = int(limit)
+    except (TypeError, ValueError):
+        n = 3
+    n = max(1, min(5, n))
+    async with pool.acquire() as conn:
+        avail = await db.available_map(conn)
+        rows = await conn.fetch(
+            """
+            SELECT p.sku, p.name, p.price, COALESCE(SUM(oi.qty), 0) AS sold
+            FROM products p
+            LEFT JOIN order_items oi ON oi.sku = p.sku
+            LEFT JOIN orders o ON o.id = oi.order_id AND o.status = 'placed'
+            GROUP BY p.sku, p.name, p.price
+            ORDER BY sold DESC, p.sku
+            """
+        )
+    picked = [r for r in rows if int(avail.get(r["sku"], 0)) > 0][:n]
+    result = {
+        "recommendations": [
+            {
+                "sku": r["sku"],
+                "name": r["name"],
+                "price": float(r["price"]),
+                "available": int(avail.get(r["sku"], 0)),
+            }
+            for r in picked
+        ]
+    }
+    _emit_result("recommend_items", call_id, result, started, session_id)
+    return result
+
+
+# --------------------------------------------------------------------------
+# Tool 8: cancel_order
+# --------------------------------------------------------------------------
+async def cancel_order(
+    pool: asyncpg.Pool, reference: str, confirm: bool = False, session_id: str | None = None
+) -> dict:
+    """Cancel a placed order and restock its items.
+
+    Cancelling is destructive, so it is gated: unless `confirm` is true this does
+    NOTHING and returns needs_confirmation. That way a single mis-selected call
+    (for example the model reaching for cancel on a status question) can never
+    destroy an order. The caller must confirm with the customer first, then call
+    again with confirm=true.
+
+    When confirmed it branches on settings.guardrails, matching reserve_items and
+    place_order: the guarded path locks the order in one transaction and is
+    idempotent, while the naive path can double-restock under two concurrent
+    cancels of the same order.
+    """
+    call_id = _emit_call("cancel_order", {"reference": reference, "confirm": confirm}, session_id)
+    started = time.perf_counter()
+    if not confirm:
+        result = {
+            "reference": reference,
+            "needs_confirmation": True,
+            "cancelled": False,
+            "message": "Confirm the cancellation with the customer, then call again with confirm=true.",
+        }
+        _emit_result("cancel_order", call_id, result, started, session_id)
+        return result
+    if settings.guardrails:
+        result = await _cancel_order_guarded(pool, reference)
+    else:
+        result = await _cancel_order_naive(pool, reference)
+    _emit_result("cancel_order", call_id, result, started, session_id)
+    if result.get("cancelled"):
+        bus.publish(
+            make_event(
+                "order_updated",
+                {
+                    "reference": result.get("reference"),
+                    "status": "cancelled",
+                    "items": result.get("restocked", []),
+                },
+                session_id,
+            )
+        )
+        await _publish_inventory_update(pool, session_id)
+    return result
+
+
+async def _cancel_order_guarded(pool, reference) -> dict:
+    ref = (reference or "").strip().upper()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            order = await conn.fetchrow(
+                "SELECT id, reference, status, total FROM orders WHERE reference = $1 FOR UPDATE",
+                ref,
+            )
+            if order is None:
+                return {"error": "unknown_order", "reference": reference}
+            if order["status"] == "cancelled":
+                return {
+                    "reference": order["reference"],
+                    "status": "cancelled",
+                    "cancelled": False,
+                    "already_cancelled": True,
+                    "restocked": [],
+                }
+            item_rows = await conn.fetch(
+                "SELECT oi.sku, oi.qty, p.name "
+                "FROM order_items oi JOIN products p ON p.sku = oi.sku "
+                "WHERE oi.order_id = $1 ORDER BY oi.sku FOR UPDATE OF p",
+                order["id"],
+            )
+            for r in item_rows:
+                await conn.execute(
+                    "UPDATE products SET qty_on_hand = qty_on_hand + $1 WHERE sku = $2",
+                    int(r["qty"]),
+                    r["sku"],
+                )
+            await conn.execute(
+                "UPDATE orders SET status = 'cancelled' WHERE id = $1", order["id"]
+            )
+            return {
+                "reference": order["reference"],
+                "status": "cancelled",
+                "cancelled": True,
+                "restocked": [
+                    {"sku": r["sku"], "name": r["name"], "qty": int(r["qty"])} for r in item_rows
+                ],
+                "total": float(order["total"]),
+            }
+
+
+async def _cancel_order_naive(pool, reference) -> dict:
+    ref = (reference or "").strip().upper()
+    async with pool.acquire() as conn:
+        order = await conn.fetchrow(
+            "SELECT id, reference, status, total FROM orders WHERE reference = $1", ref
+        )
+        if order is None:
+            return {"error": "unknown_order", "reference": reference}
+        if order["status"] == "cancelled":
+            return {
+                "reference": order["reference"],
+                "status": "cancelled",
+                "cancelled": False,
+                "already_cancelled": True,
+                "restocked": [],
+            }
+        item_rows = await conn.fetch(
+            "SELECT oi.sku, oi.qty, p.name "
+            "FROM order_items oi JOIN products p ON p.sku = oi.sku "
+            "WHERE oi.order_id = $1 ORDER BY oi.sku",
+            order["id"],
+        )
+    # Widen the read to write window so two concurrent cancels both read 'placed'
+    # and both restock (a lost update that over-restocks), the cancel-side mirror
+    # of the oversell race.
+    await asyncio.sleep(0.1)
+    for r in item_rows:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE products SET qty_on_hand = qty_on_hand + $1 WHERE sku = $2",
+                int(r["qty"]),
+                r["sku"],
+            )
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE orders SET status = 'cancelled' WHERE id = $1", order["id"]
+        )
+    return {
+        "reference": order["reference"],
+        "status": "cancelled",
+        "cancelled": True,
+        "restocked": [
+            {"sku": r["sku"], "name": r["name"], "qty": int(r["qty"])} for r in item_rows
+        ],
+        "total": float(order["total"]),
+    }
+
+
+# --------------------------------------------------------------------------
 # Model-facing schemas + dispatch map
 # --------------------------------------------------------------------------
 TOOL_SCHEMAS = [
@@ -675,6 +906,53 @@ TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "lookup_order",
+            "description": "Use this for ANY question about an existing order: its status, what is in it, or its total. Read only, changes nothing. Takes the order reference (for example ABEG-7F3K9Q) and returns status, items, quantities, unit prices and total. Returns unknown_order if the reference does not exist. This is the tool for 'what is the status of my order', never cancel_order.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reference": {"type": "string", "description": "Order reference, e.g. ABEG-7F3K9Q."},
+                },
+                "required": ["reference"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recommend_items",
+            "description": "Suggest popular in-stock menu items. Only ever returns items that exist and are currently available. Use when the customer asks what is good, what to get, or for a suggestion.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "How many items to suggest.", "default": 3},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_order",
+            "description": "Cancel a placed order and return its items to stock. ONLY when the customer explicitly asks to cancel, never on a status question. Destructive and gated: first show the order (use lookup_order) and get the customer's explicit yes, then call this with confirm=true. Called without confirm=true it does NOT cancel; it only signals that confirmation is still needed. Returns unknown_order if the reference does not exist.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reference": {"type": "string", "description": "Order reference, e.g. ABEG-7F3K9Q."},
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "Must be true to actually cancel. Set it only after the customer explicitly confirms.",
+                        "default": False,
+                    },
+                },
+                "required": ["reference"],
+            },
+        },
+    },
 ]
 
 
@@ -684,4 +962,7 @@ TOOL_FUNCS = {
     "reserve_items": reserve_items,
     "place_order": place_order,
     "cancel_reservation": cancel_reservation,
+    "lookup_order": lookup_order,
+    "recommend_items": recommend_items,
+    "cancel_order": cancel_order,
 }

@@ -11,8 +11,45 @@ import uuid
 import pytest
 
 from app import agent
-from app.agent import SESSIONS, run_turn
+from app.agent import SESSIONS, _PreambleStripper, run_turn
 from app.config import settings
+
+
+# ---------------------------------------------------------------------------
+# _PreambleStripper: drop leaked tool-scaffolding, keep real replies intact.
+# ---------------------------------------------------------------------------
+_PREAMBLE = (
+    "Use the results below to formulate an answer to the user question unless "
+    "additional information is needed."
+)
+
+
+def _run_stripper(chunks: list[str]) -> str:
+    s = _PreambleStripper()
+    out = "".join(s.feed(c) for c in chunks)
+    return out + s.flush()
+
+
+def test_stripper_drops_leaked_preamble_before_reply():
+    chunks = [_PREAMBLE, "\n\nYour order ABEG-4ACNKS is placed."]
+    assert _run_stripper(chunks) == "Your order ABEG-4ACNKS is placed."
+
+
+def test_stripper_drops_preamble_split_across_deltas():
+    # The preamble arrives token by token, then the real reply.
+    chunks = ["Use the results ", "below to formulate an answer to the user ",
+              "question unless additional information is needed.", " Your order is placed."]
+    assert _run_stripper(chunks) == "Your order is placed."
+
+
+def test_stripper_leaves_normal_reply_untouched():
+    chunks = ["We have ", "Party Jollof Rice for 3,500. ", "How many?"]
+    assert _run_stripper(chunks) == "We have Party Jollof Rice for 3,500. How many?"
+
+
+def test_stripper_keeps_reply_that_merely_starts_like_preamble():
+    chunks = ["Use ", "your reference ABEG-1234 to track it."]
+    assert _run_stripper(chunks) == "Use your reference ABEG-1234 to track it."
 
 
 def _new_sid() -> str:

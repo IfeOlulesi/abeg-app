@@ -23,7 +23,7 @@ That screenshot turned out to be fake, but the failure behind it is real and com
 
 ## What it does
 
-You order by typing, or by holding the mic and talking. The assistant answers by calling tools against a Postgres database, so it can only tell you what is actually on the menu, at the real price, in the real quantity. When something runs out, it says so.
+You order by typing, or by holding the mic and talking. The assistant answers by calling tools against a Postgres database, so it can only tell you what is actually on the menu, at the real price, in the real quantity. When something runs out, it says so. It can also look up an order by its reference, suggest popular in-stock items, and cancel a placed order (which returns the items to stock).
 
 Open **the Workshop** (top right, or press `B`) and you can turn the same knobs an AI engineer turns, each with plain-language help and a one-tap "try it".
 
@@ -46,6 +46,14 @@ This is the part worth stealing.
 | **Stay on task** | Gets talked into writing your code (the McDonald's bug) | Declines, steers back to ordering |
 
 Both are real: a firm instruction in the prompt, plus a second check on the way out that catches a bad answer even when the model slips. Press `4` to send the "order jollof, then help me reverse a linked list" message with **Stay on task** off, watch it get hijacked, then flip it on and watch it hold.
+
+## The Report Card
+
+Toggling a guardrail and watching one chat is a gesture. The professional version is an eval: a fixed set of scenarios you run on every change to prove the guardrails still hold. Open the Workshop and press `E` (or the Report Card tab) to run it.
+
+Each case runs a real scenario through the agent and grades whether the system did the right thing for the current settings. It is deterministic and offline, so it needs no key and costs nothing. Well-behaved cases use the cached model; adversarial cases use small stand-in models that misbehave on purpose (fabricate a price, attempt the code hijack, loop forever). Nothing here places an order or changes stock, so it is safe to run any time.
+
+The score reacts to the switches. With grounding and stay-on-task on, every case is green. Turn grounding off on the Tinker tab, run it again, and the made-up-price case flips from "Held" to "Slipped". Same app, one switch.
 
 ## When systems bite
 
@@ -99,6 +107,7 @@ Open http://localhost:8000.
 | `C` | Toggle cached / offline mode |
 | `X` | Reset the data |
 | `B` | Open the Workshop |
+| `E` | Run the Report Card (grade the guardrails) |
 
 ## Tests
 

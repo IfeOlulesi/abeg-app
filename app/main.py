@@ -17,7 +17,7 @@ from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from app import agent, db, seed
+from app import agent, db, evals, seed
 from app import tools
 from app.config import settings, AVAILABLE_MODELS
 from app.events import bus, make_event
@@ -458,6 +458,18 @@ async def control_reset():
     products = await _publish_inventory_update(pool)
     bus.publish(make_event("notice", {"message": "reset to seed"}))
     return {"products": products}
+
+
+@app.get("/api/evals")
+async def api_evals():
+    """List the Report Card cases so the UI can preview the suite."""
+    return {"cases": evals.list_cases()}
+
+
+@app.post("/api/evals/run")
+async def api_evals_run():
+    """Run the guardrail eval suite against the current settings and return the scorecard."""
+    return await evals.run_suite(app.state.pool)
 
 
 @app.post("/api/control/race")

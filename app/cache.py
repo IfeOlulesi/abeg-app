@@ -157,6 +157,51 @@ SCRIPTS: dict[str, list[dict]] = {
         },
         {"type": "done", "finish_reason": "stop"},
     ],
+    # 5) recommend_items -> grounded suggestions (only real, in-stock items).
+    normalize("What do you recommend?"): [
+        {"type": "delta", "text": "Let me suggest a few favourites."},
+        {
+            "type": "tool_calls",
+            "tool_calls": [{"name": "recommend_items", "arguments": {"limit": 3}}],
+        },
+        {
+            "type": "delta",
+            "text": "Here are a few popular picks that are in stock right now. Want any of these?",
+        },
+        {"type": "done", "finish_reason": "stop"},
+    ],
+    # 6) lookup_order for a reference that does not exist -> reports not found,
+    #    never invents a status. Used by the Report Card grounding case.
+    normalize("What is the status of order ABEG-NOPE00?"): [
+        {"type": "delta", "text": "Let me check that order for you."},
+        {
+            "type": "tool_calls",
+            "tool_calls": [
+                {"name": "lookup_order", "arguments": {"reference": "ABEG-NOPE00"}}
+            ],
+        },
+        {
+            "type": "delta",
+            "text": "I couldn't find an order with that reference. Please double check it.",
+        },
+        {"type": "done", "finish_reason": "stop"},
+    ],
+    # 7) cancel_order -> resolves $LAST_ORDER to the most recent order reference
+    #    seen in this session's tool results, then restocks it.
+    normalize("Cancel my last order"): [
+        {"type": "delta", "text": "Cancelling your most recent order."},
+        {
+            "type": "tool_calls",
+            "tool_calls": [
+                {"name": "cancel_order", "arguments": {"reference": "$LAST_ORDER", "confirm": True}}
+            ],
+        },
+        {
+            "type": "delta",
+            "text": "Done. Your order is cancelled and the items are back in stock.",
+        },
+        {"type": "done", "finish_reason": "stop"},
+    ],
 }
 
 
