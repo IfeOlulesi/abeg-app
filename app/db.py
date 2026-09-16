@@ -46,18 +46,30 @@ def _load_schema_sql() -> str:
     return _SCHEMA_PATH.read_text()
 
 
-async def apply_schema(pool: asyncpg.Pool) -> bool:
-    """Apply schema.sql if not already applied.
+# Idempotent migrations applied on every startup, after the base schema exists.
+# These bring an older database (for example a persisted Docker volume created
+# before a column was added) up to date without dropping data. Each statement
+# must be safe to run repeatedly.
+_MIGRATIONS: tuple[str, ...] = (
+    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'placed'",
+)
 
-    Idempotent: only runs the DDL when the `products` table is absent.
-    Returns True if schema was applied, False if it already existed.
+
+async def apply_schema(pool: asyncpg.Pool) -> bool:
+    """Apply schema.sql if not already applied, then run idempotent migrations.
+
+    The base DDL only runs when the `products` table is absent. The migrations
+    run every time so an existing database gains any newly added columns.
+    Returns True if the base schema was freshly applied, False if it existed.
     """
     async with pool.acquire() as conn:
         exists = await conn.fetchval("SELECT to_regclass('public.products')")
-        if exists is not None:
-            return False
-        await conn.execute(_load_schema_sql())
-        return True
+        fresh = exists is None
+        if fresh:
+            await conn.execute(_load_schema_sql())
+        for statement in _MIGRATIONS:
+            await conn.execute(statement)
+        return fresh
 
 
 async def available_map(

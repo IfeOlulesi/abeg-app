@@ -138,6 +138,54 @@ async def test_expired_reservation_releases_stock(pool, stock, expire_reservatio
     assert after["qty_on_hand"] == before["qty_on_hand"]
 
 
+# ---------------------------------------------------------------------------
+# Naive cancel_order: two concurrent cancels of the same order can double-restock
+# (the cancel-side mirror of the oversell). Guarded mode prevents it.
+# ---------------------------------------------------------------------------
+async def test_naive_cancel_double_restock(pool, stock):
+    from app import seed
+
+    oversold = None
+    rounds = 5
+    for _ in range(rounds):
+        await seed.reset_seed(pool)
+        settings.guardrails = True
+        before = await stock("SUYA")
+        reserve = await tools.reserve_items(pool, [{"sku": "SUYA", "qty": 2}], "cancel-sess")
+        order = await tools.place_order(pool, reserve["reservation_id"], "Ada")
+
+        # Fire two concurrent cancels of the SAME order on the naive path.
+        settings.guardrails = False
+        await asyncio.gather(
+            tools.cancel_order(pool, order["reference"], confirm=True),
+            tools.cancel_order(pool, order["reference"], confirm=True),
+        )
+        after = await stock("SUYA")
+        # Over-restock signature: on-hand climbs above the original seed level.
+        if after["qty_on_hand"] > before["qty_on_hand"]:
+            oversold = after["qty_on_hand"]
+            break
+
+    assert oversold is not None, (
+        f"naive cancel failed to double-restock across {rounds} rounds"
+    )
+
+
+async def test_guarded_cancel_restocks_exactly_once_under_race(pool, stock):
+    settings.guardrails = True
+    before = await stock("SUYA")
+    reserve = await tools.reserve_items(pool, [{"sku": "SUYA", "qty": 2}], "cancel-sess-2")
+    order = await tools.place_order(pool, reserve["reservation_id"], "Ada")
+
+    # Two concurrent guarded cancels: exactly one restocks, the other is a no-op.
+    await asyncio.gather(
+        tools.cancel_order(pool, order["reference"], confirm=True),
+        tools.cancel_order(pool, order["reference"], confirm=True),
+    )
+    after = await stock("SUYA")
+    assert after["qty_on_hand"] == before["qty_on_hand"]  # restocked exactly once
+
+
 async def test_expired_reservation_short_ttl(pool, stock):
     """Same guarantee via a very short reservation_ttl_seconds instead of a helper."""
     settings.guardrails = True

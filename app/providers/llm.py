@@ -162,6 +162,7 @@ class CachedLlm(LlmProvider):
             steps = cache.steps_for(last_user)
 
         last_res = self._last_reservation_id(messages)
+        last_order = self._last_order_reference(messages)
 
         # A script may contain several tool_calls steps. The agent calls stream()
         # once per loop iteration, executing tools between calls. We therefore
@@ -181,7 +182,7 @@ class CachedLlm(LlmProvider):
                     continue
                 calls = []
                 for c in step["tool_calls"]:
-                    args = self._resolve_args(c.get("arguments", {}), last_res)
+                    args = self._resolve_args(c.get("arguments", {}), last_res, last_order)
                     calls.append(
                         {"id": f"call_{uuid.uuid4().hex[:8]}", "name": c["name"], "arguments": args}
                     )
@@ -242,10 +243,12 @@ class CachedLlm(LlmProvider):
         return n in {"no", "nope", "cancel", "nah", "don't", "dont"} or "cancel" in n
 
     @staticmethod
-    def _resolve_args(args: dict, last_res: str | None) -> dict:
+    def _resolve_args(args: dict, last_res: str | None, last_order: str | None = None) -> dict:
         resolved = json.loads(json.dumps(args))  # deep copy
         if resolved.get("reservation_id") == "$LAST_RESERVATION" and last_res:
             resolved["reservation_id"] = last_res
+        if resolved.get("reference") == "$LAST_ORDER" and last_order:
+            resolved["reference"] = last_order
         return resolved
 
     @staticmethod
@@ -264,6 +267,24 @@ class CachedLlm(LlmProvider):
             rid = data.get("reservation_id")
             if rid:
                 return rid
+        return None
+
+    @staticmethod
+    def _last_order_reference(messages: list[dict]) -> str | None:
+        """Scan tool result messages for the most recent order reference."""
+        for m in reversed(messages):
+            if m.get("role") != "tool":
+                continue
+            content = m.get("content")
+            if not isinstance(content, str):
+                continue
+            try:
+                data = json.loads(content)
+            except json.JSONDecodeError:
+                continue
+            # place_order returns a reference; ignore an error payload.
+            if data.get("reference") and not data.get("error"):
+                return data["reference"]
         return None
 
 

@@ -166,3 +166,134 @@ async def test_cancel_reservation_returns_stock(pool, stock):
             reserve["reservation_id"],
         )
     assert status == "cancelled"
+
+
+# ---------------------------------------------------------------------------
+# lookup_order
+# ---------------------------------------------------------------------------
+async def _place_suya_order(pool, qty: int = 2, name: str = "Ada") -> dict:
+    reserve = await tools.reserve_items(pool, [{"sku": "SUYA", "qty": qty}], SID)
+    return await tools.place_order(pool, reserve["reservation_id"], name)
+
+
+async def test_lookup_order_found(pool):
+    order = await _place_suya_order(pool, qty=2)
+    res = await tools.lookup_order(pool, order["reference"])
+    assert res["reference"] == order["reference"]
+    assert res["status"] == "placed"
+    assert res["total"] == SUYA_PRICE * 2
+    assert res["customer_name"] == "Ada"
+    by_sku = {i["sku"]: i for i in res["items"]}
+    assert by_sku["SUYA"]["qty"] == 2
+    assert by_sku["SUYA"]["unit_price"] == float(SUYA_PRICE)
+
+
+async def test_lookup_order_unknown(pool):
+    res = await tools.lookup_order(pool, "ABEG-NOPE00")
+    assert res == {"error": "unknown_order", "reference": "ABEG-NOPE00"}
+
+
+async def test_lookup_order_normalizes_reference(pool):
+    order = await _place_suya_order(pool, qty=1)
+    res = await tools.lookup_order(pool, "  " + order["reference"].lower() + "  ")
+    assert res["reference"] == order["reference"]
+
+
+# ---------------------------------------------------------------------------
+# recommend_items
+# ---------------------------------------------------------------------------
+async def test_recommend_returns_in_stock_only(pool):
+    res = await tools.recommend_items(pool, limit=5)
+    recs = res["recommendations"]
+    assert recs, "should recommend something from the seeded catalog"
+    assert all(r["available"] > 0 for r in recs)
+    assert len(recs) <= 5
+
+
+async def test_recommend_respects_limit(pool):
+    res = await tools.recommend_items(pool, limit=2)
+    assert len(res["recommendations"]) == 2
+
+
+async def test_recommend_excludes_out_of_stock(pool, stock):
+    # JOLLOF has a single unit; sell it so availability drops to 0.
+    reserve = await tools.reserve_items(pool, [{"sku": "JOLLOF", "qty": 1}], SID)
+    await tools.place_order(pool, reserve["reservation_id"], "Ada")
+    assert (await stock("JOLLOF"))["available"] == 0
+
+    res = await tools.recommend_items(pool, limit=10)
+    assert "JOLLOF" not in {r["sku"] for r in res["recommendations"]}
+
+
+async def test_recommend_ranks_by_popularity(pool):
+    # Sell a lot of SUYA; it should rank first by real order history.
+    reserve = await tools.reserve_items(pool, [{"sku": "SUYA", "qty": 5}], SID)
+    await tools.place_order(pool, reserve["reservation_id"], "Ada")
+    res = await tools.recommend_items(pool, limit=3)
+    assert res["recommendations"][0]["sku"] == "SUYA"
+
+
+# ---------------------------------------------------------------------------
+# cancel_order (guarded)
+# ---------------------------------------------------------------------------
+async def test_cancel_order_requires_confirmation(pool, stock):
+    # Without confirm=true, cancel is a no-op: it must not touch the order or stock.
+    before = await stock("SUYA")
+    order = await _place_suya_order(pool, qty=2)
+    on_hand_after_order = (await stock("SUYA"))["qty_on_hand"]
+
+    res = await tools.cancel_order(pool, order["reference"])  # no confirm
+    assert res["needs_confirmation"] is True
+    assert res["cancelled"] is False
+
+    # Order still placed, stock unchanged by the unconfirmed call.
+    assert (await stock("SUYA"))["qty_on_hand"] == on_hand_after_order
+    async with pool.acquire() as conn:
+        status = await conn.fetchval(
+            "SELECT status FROM orders WHERE reference = $1", order["reference"]
+        )
+    assert status == "placed"
+    assert on_hand_after_order == before["qty_on_hand"] - 2
+
+
+async def test_cancel_order_restocks_once(pool, stock):
+    before = await stock("SUYA")
+    order = await _place_suya_order(pool, qty=2)
+    assert (await stock("SUYA"))["qty_on_hand"] == before["qty_on_hand"] - 2
+
+    res = await tools.cancel_order(pool, order["reference"], confirm=True)
+    assert res["cancelled"] is True
+    assert res["status"] == "cancelled"
+    assert {i["sku"]: i["qty"] for i in res["restocked"]} == {"SUYA": 2}
+
+    after = await stock("SUYA")
+    assert after["qty_on_hand"] == before["qty_on_hand"]  # fully restocked
+
+    async with pool.acquire() as conn:
+        status = await conn.fetchval(
+            "SELECT status FROM orders WHERE reference = $1", order["reference"]
+        )
+    assert status == "cancelled"
+
+
+async def test_cancel_order_idempotent_no_double_restock(pool, stock):
+    before = await stock("SUYA")
+    order = await _place_suya_order(pool, qty=2)
+
+    first = await tools.cancel_order(pool, order["reference"], confirm=True)
+    assert first["cancelled"] is True
+    restocked = await stock("SUYA")
+    assert restocked["qty_on_hand"] == before["qty_on_hand"]
+
+    second = await tools.cancel_order(pool, order["reference"], confirm=True)
+    assert second["cancelled"] is False
+    assert second.get("already_cancelled") is True
+    assert second["restocked"] == []
+
+    # A second cancel must not restock again.
+    assert (await stock("SUYA"))["qty_on_hand"] == restocked["qty_on_hand"]
+
+
+async def test_cancel_order_unknown(pool):
+    res = await tools.cancel_order(pool, "ABEG-NOPE00", confirm=True)
+    assert res == {"error": "unknown_order", "reference": "ABEG-NOPE00"}

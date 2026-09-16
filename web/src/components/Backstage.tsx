@@ -23,6 +23,9 @@ import {
 import { naira, firstLine, formatCost, formatMs, tempLabel } from '../lib/format';
 import ByokCard from './ByokCard';
 import type {
+  EvalCaseResult,
+  EvalReport,
+  EvalStatus,
   Model,
   Product,
   Script,
@@ -100,6 +103,7 @@ function TryButton({ onClick, children }: { onClick: () => void; children: React
 const TABS: { id: string; label: string; icon: IconType }[] = [
   { id: 'tinker', label: 'Tinker', icon: SlidersIcon },
   { id: 'anatomy', label: 'X-ray', icon: SearchIcon },
+  { id: 'report', label: 'Report Card', icon: ShieldIcon },
   { id: 'stock', label: 'Stock', icon: BoxIcon },
 ];
 
@@ -132,6 +136,10 @@ interface BackstageProps {
   products: Product[];
   timeline: TimelineItem[];
   trace: Trace | null;
+  report: EvalReport | null;
+  onRunEvals: () => void;
+  evalsRunning: boolean;
+  showReportSignal: number;
 }
 
 export default function Backstage({
@@ -160,6 +168,10 @@ export default function Backstage({
   products,
   timeline,
   trace,
+  report,
+  onRunEvals,
+  evalsRunning,
+  showReportSignal,
 }: BackstageProps) {
   const [tab, setTab] = useState('tinker');
   const [draft, setDraft] = useState(systemPrompt || '');
@@ -168,6 +180,11 @@ export default function Backstage({
   useEffect(() => {
     setDraft(systemPrompt || '');
   }, [systemPrompt]);
+
+  // Pressing the E shortcut bumps this signal; jump to the Report Card tab.
+  useEffect(() => {
+    if (showReportSignal > 0) setTab('report');
+  }, [showReportSignal]);
 
   const promptDirty = draft.trim() !== (systemPrompt || '').trim();
   const scriptList =
@@ -415,6 +432,10 @@ export default function Backstage({
 
         {tab === 'anatomy' && <Anatomy trace={trace} timeline={timeline} />}
 
+        {tab === 'report' && (
+          <ReportCard report={report} onRun={onRunEvals} running={evalsRunning} />
+        )}
+
         {tab === 'stock' && (
           <div className="space-y-4">
             <Knob
@@ -634,6 +655,139 @@ function Anatomy({ trace, timeline }: { trace: Trace | null; timeline: TimelineI
           </div>
         </section>
       )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Report Card tab: deterministic guardrail eval suite                 */
+/* ------------------------------------------------------------------ */
+const VERDICT: Record<EvalStatus, { label: string; cls: string }> = {
+  held: { label: 'Held', cls: 'bg-green-50 text-green-600 dark:bg-green-500/15 dark:text-green-400' },
+  grounded: { label: 'Grounded', cls: 'bg-green-50 text-green-600 dark:bg-green-500/15 dark:text-green-400' },
+  info: { label: 'OK', cls: 'bg-stone-100 text-stone-500 dark:bg-stone-800 dark:text-stone-400' },
+  slipped: { label: 'Slipped', cls: 'bg-amber-50 text-amber-600 dark:bg-amber-500/15 dark:text-amber-300' },
+  failed: { label: 'Failed', cls: 'bg-rose-50 text-rose-500 dark:bg-rose-500/15 dark:text-rose-400' },
+};
+
+function RunEvalsButton({
+  onRun,
+  running,
+  subtle,
+}: {
+  onRun: () => void;
+  running: boolean;
+  subtle?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onRun}
+      disabled={running}
+      className={
+        subtle
+          ? 'inline-flex flex-none items-center gap-2 rounded-lg bg-stone-100 px-3 py-1.5 text-[12.5px] font-bold text-stone-600 transition enabled:hover:bg-stone-200 disabled:opacity-60 dark:bg-stone-800 dark:text-stone-300 dark:enabled:hover:bg-stone-700'
+          : 'inline-flex items-center gap-2 rounded-xl bg-stone-900 px-4 py-2.5 text-[13px] font-bold text-white transition enabled:hover:bg-stone-800 disabled:opacity-60 dark:bg-stone-100 dark:text-stone-900 dark:enabled:hover:bg-white'
+      }
+    >
+      <ShieldIcon className="h-4 w-4" />
+      {running ? 'Running...' : subtle ? 'Run again' : 'Run the Report Card'}
+    </button>
+  );
+}
+
+function CaseRow({ c }: { c: EvalCaseResult }) {
+  const v = VERDICT[c.status] || VERDICT.info;
+  return (
+    <li className="rounded-2xl bg-white p-3.5 ring-1 ring-stone-100 dark:bg-stone-900 dark:ring-stone-800">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[13px] font-bold text-stone-800 dark:text-stone-200">{c.title}</span>
+        <span className={`flex-none rounded-full px-2.5 py-0.5 text-[11px] font-bold ${v.cls}`}>
+          {v.label}
+        </span>
+      </div>
+      <p className="mt-1 text-[12.5px] leading-snug text-stone-500 dark:text-stone-400">{c.outcome}</p>
+    </li>
+  );
+}
+
+function ReportCard({
+  report,
+  onRun,
+  running,
+}: {
+  report: EvalReport | null;
+  onRun: () => void;
+  running: boolean;
+}) {
+  if (!report) {
+    return (
+      <div className="grid place-items-center rounded-2xl bg-white px-6 py-14 text-center ring-1 ring-stone-100 dark:bg-stone-900 dark:ring-stone-800">
+        <ShieldIcon className="h-7 w-7 text-stone-300 dark:text-stone-600" />
+        <p className="mt-3 text-[13px] font-semibold text-stone-500 dark:text-stone-400">
+          Grade the guardrails
+        </p>
+        <p className="mt-1 mb-4 max-w-[300px] text-[12px] leading-snug text-stone-400 dark:text-stone-500">
+          Runs a fixed set of scenarios through the AI and checks whether each guardrail holds for
+          the current settings. Deterministic, offline, and free. Flip a switch on the Tinker tab,
+          run it again, and watch the score change.
+        </p>
+        <RunEvalsButton onRun={onRun} running={running} />
+      </div>
+    );
+  }
+
+  const s = report.summary;
+  const allGreen = s.failed === 0 && s.disabled === 0;
+  const badge = (on: boolean) =>
+    on
+      ? 'bg-green-50 text-green-600 dark:bg-green-500/15 dark:text-green-400'
+      : 'bg-amber-50 text-amber-600 dark:bg-amber-500/15 dark:text-amber-300';
+
+  return (
+    <div className="space-y-4">
+      <section className="rounded-2xl bg-white p-4 ring-1 ring-stone-100 dark:bg-stone-900 dark:ring-stone-800">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="text-[22px] font-bold tnum text-stone-900 dark:text-stone-100">
+              {s.holding} <span className="text-stone-300 dark:text-stone-600">/</span> {s.total}
+            </div>
+            <div className="text-[12.5px] font-semibold text-stone-500 dark:text-stone-400">
+              guardrails currently holding
+            </div>
+          </div>
+          <RunEvalsButton onRun={onRun} running={running} subtle />
+        </div>
+        <div className="mt-3 flex flex-wrap gap-1.5 text-[11px] font-bold">
+          <span className={`rounded-full px-2.5 py-1 ${badge(report.settings.guardrails)}`}>
+            grounding {report.settings.guardrails ? 'on' : 'off'}
+          </span>
+          <span className={`rounded-full px-2.5 py-1 ${badge(report.settings.on_task)}`}>
+            stay-on-task {report.settings.on_task ? 'on' : 'off'}
+          </span>
+          {s.disabled > 0 && (
+            <span className="rounded-full bg-amber-50 px-2.5 py-1 text-amber-600 dark:bg-amber-500/15 dark:text-amber-300">
+              {s.disabled} disabled
+            </span>
+          )}
+          {s.failed > 0 && (
+            <span className="rounded-full bg-rose-50 px-2.5 py-1 text-rose-500 dark:bg-rose-500/15 dark:text-rose-400">
+              {s.failed} failing
+            </span>
+          )}
+          {allGreen && (
+            <span className="rounded-full bg-green-50 px-2.5 py-1 text-green-600 dark:bg-green-500/15 dark:text-green-400">
+              all guardrails holding
+            </span>
+          )}
+        </div>
+      </section>
+
+      <ul className="space-y-2">
+        {report.cases.map((c) => (
+          <CaseRow key={c.id} c={c} />
+        ))}
+      </ul>
     </div>
   );
 }

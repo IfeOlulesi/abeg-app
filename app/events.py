@@ -9,7 +9,8 @@ blocking the publisher (robust to slow consumers).
 """
 import asyncio
 import time
-from typing import AsyncIterator
+from contextlib import contextmanager
+from typing import AsyncIterator, Iterator
 
 _QUEUE_MAXSIZE = 256
 
@@ -32,10 +33,27 @@ class EventBus:
         self._sessions: dict[str, set[asyncio.Queue]] = {}
         # Cache of the most recent inventory_update payload (products list).
         self.latest_inventory: list[dict] | None = None
+        # When muted, publish is a no-op. Used to run the eval suite through the
+        # real agent loop without leaking its events into the operator stream or
+        # overwriting the live X-ray.
+        self._muted = False
+
+    # ---- muting -----------------------------------------------------------
+    @contextmanager
+    def muted(self) -> Iterator[None]:
+        """Suppress all publishing for the duration of the block."""
+        previous = self._muted
+        self._muted = True
+        try:
+            yield
+        finally:
+            self._muted = previous
 
     # ---- publishing -------------------------------------------------------
     def publish(self, event: dict) -> None:
         """Fan out an event to all live subscribers (drop on full queue)."""
+        if self._muted:
+            return
         if event.get("type") == "inventory_update":
             self.latest_inventory = event.get("data", {}).get("products")
 
